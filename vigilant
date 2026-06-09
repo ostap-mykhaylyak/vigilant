@@ -370,18 +370,25 @@ function setSecurityLevel(array $config, string $level): void
 }
 
 /**
- * Interroga la GraphQL Analytics API per le richieste totali verso la zona
+ * Interroga la GraphQL Analytics API per le richieste verso la zona
  * nell'ultima finestra di N minuti e restituisce la media richieste/sec.
  *
+ * Usa il dataset `httpRequestsAdaptiveGroups`, disponibile su TUTTI i piani
+ * (Free incluso). NB: il dataset `httpRequests1mGroups` (granularita 1 min)
+ * e' riservato ai piani Business/Enterprise e restituirebbe un errore authz.
+ *
+ * Poiche' il dataset adaptive e' CAMPIONATO, il numero reale di richieste si
+ * stima moltiplicando `count` (campioni) per `avg.sampleInterval`.
+ *
  * Richiede che l'API Token abbia anche il permesso:
- *   Zone > Analytics > Read   (Account Analytics non basta).
+ *   Zone > Analytics > Read   (l'Account Analytics non basta).
  */
 function getRequestsPerSecond(array $config): float
 {
     $minutes = max(1, (int)$config['req_window_minutes']);
 
-    // I dati di httpRequests1mGroups hanno un piccolo ritardo: chiudiamo la
-    // finestra a "ora - 1 minuto" per evitare l'ultimo minuto incompleto.
+    // I dati hanno un piccolo ritardo: chiudiamo la finestra a "ora - 1 minuto"
+    // per non includere l'ultimo minuto ancora incompleto.
     $end   = new DateTimeImmutable('-1 minute', new DateTimeZone('UTC'));
     $start = $end->sub(new DateInterval("PT{$minutes}M"));
     $fmt   = 'Y-m-d\TH:i:s\Z';
@@ -390,11 +397,12 @@ function getRequestsPerSecond(array $config): float
     query ($zoneTag: String!, $start: Time!, $end: Time!) {
       viewer {
         zones(filter: { zoneTag: $zoneTag }) {
-          httpRequests1mGroups(
+          httpRequestsAdaptiveGroups(
             limit: 1000
             filter: { datetime_geq: $start, datetime_lt: $end }
           ) {
-            sum { requests }
+            count
+            avg { sampleInterval }
           }
         }
       }
@@ -410,17 +418,20 @@ function getRequestsPerSecond(array $config): float
         ],
     ]);
 
-    // La GraphQL API puo restituire success=true con errori applicativi.
+    // La GraphQL API puo restituire HTTP 200 con errori applicativi nel body.
     if (!empty($resp['errors'])) {
         throw new RuntimeException(
             'GraphQL Analytics ha restituito errori: ' . json_encode($resp['errors'])
         );
     }
 
-    $groups = $resp['data']['viewer']['zones'][0]['httpRequests1mGroups'] ?? [];
-    $total  = 0;
+    $groups = $resp['data']['viewer']['zones'][0]['httpRequestsAdaptiveGroups'] ?? [];
+    $total  = 0.0;
     foreach ($groups as $g) {
-        $total += (int)($g['sum']['requests'] ?? 0);
+        $count    = (float)($g['count'] ?? 0);
+        $interval = (float)($g['avg']['sampleInterval'] ?? 1);
+        // De-campionamento: stima delle richieste reali.
+        $total += $count * ($interval > 0 ? $interval : 1);
     }
 
     return $total / ($minutes * 60);
