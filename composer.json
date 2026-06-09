@@ -1,0 +1,20 @@
+{
+    "name": "ostap-mykhaylyak/vigilant",
+    "description": "CLI tool that auto-enables Cloudflare Under Attack Mode when server load or request rate crosses configurable thresholds.",
+    "type": "project",
+    "keywords": ["cloudflare", "under-attack-mode", "ddos", "security", "cli", "cron", "shared-hosting"],
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Ostap Mykhaylyak"
+        }
+    ],
+    "require": {
+        "php": ">=8.0",
+        "ext-json": "*"
+    },
+    "suggest": {
+        "ext-curl": "Preferred HTTP transport; falls back to stream wrappers if absent."
+    },
+    "bin": ["vigilant"]
+}

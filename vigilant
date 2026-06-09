@@ -1,0 +1,562 @@
+#!/usr/bin/env php
+<?php
+/**
+ * vigilant — Cloudflare auto Under Attack Mode
+ *
+ * Monitora il carico del server e/o le richieste/sec verso una zona
+ * Cloudflare e attiva automaticamente la modalità "Under Attack" (UAM)
+ * quando vengono superate determinate soglie, disattivandola al rientro.
+ *
+ * Pensato per esecuzione via CLI/cron. NON accetta credenziali come
+ * parametri (sarebbero visibili in `ps aux`/`/proc`): le legge da un file
+ * di configurazione protetto (chmod 600).
+ *
+ * @package   vigilant
+ * @author    Ostap Mykhaylyak
+ * @license   MIT
+ * @link      https://github.com/ostap-mykhaylyak/vigilant
+ */
+
+declare(strict_types=1);
+
+const VIGILANT_VERSION = '1.0.0';
+
+// Codici di uscita (convenzione: 0=ok, 1=errore runtime, 2=uso/config errati).
+const EXIT_OK      = 0;
+const EXIT_RUNTIME = 1;
+const EXIT_USAGE   = 2;
+
+if (PHP_SAPI !== 'cli') {
+    fwrite(STDERR, "Questo script va eseguito solo da CLI.\n");
+    exit(EXIT_USAGE);
+}
+
+/**
+ * Stampa l'help e termina.
+ */
+function printUsage(): void
+{
+    $name = basename($GLOBALS['argv'][0]);
+    $ver  = VIGILANT_VERSION;
+    echo <<<TXT
+    vigilant v{$ver} — Cloudflare auto Under Attack Mode
+
+    USO:
+      php {$name} [opzioni]
+
+    OPZIONI:
+      --config=PATH   Percorso del file di configurazione
+                      (default: ./config.php accanto allo script)
+      --status        Mostra metriche correnti e security level, poi esce
+      --force-on      Forza l'attivazione della modalità Under Attack
+      --force-off     Forza il ritorno al security level normale
+      -h, --help      Mostra questo aiuto
+      -V, --version   Mostra la versione
+
+    Senza opzioni esegue un ciclo di valutazione (uso previsto: cron).
+
+    DOC: https://github.com/ostap-mykhaylyak/vigilant
+
+    TXT;
+}
+
+// ---------------------------------------------------------------------------
+// Parsing argomenti
+// ---------------------------------------------------------------------------
+$opts = [
+    'config'    => __DIR__ . '/config.php',
+    'force-on'  => false,
+    'force-off' => false,
+    'status'    => false,
+];
+
+foreach (array_slice($argv, 1) as $arg) {
+    if (str_starts_with($arg, '--config=')) {
+        $opts['config'] = substr($arg, strlen('--config='));
+    } elseif ($arg === '--force-on') {
+        $opts['force-on'] = true;
+    } elseif ($arg === '--force-off') {
+        $opts['force-off'] = true;
+    } elseif ($arg === '--status') {
+        $opts['status'] = true;
+    } elseif ($arg === '-h' || $arg === '--help') {
+        printUsage();
+        exit(EXIT_OK);
+    } elseif ($arg === '-V' || $arg === '--version') {
+        echo 'vigilant ' . VIGILANT_VERSION . "\n";
+        exit(EXIT_OK);
+    } else {
+        fwrite(STDERR, "Argomento sconosciuto: {$arg}\n");
+        fwrite(STDERR, "Usa --help per la lista delle opzioni.\n");
+        exit(EXIT_USAGE);
+    }
+}
+
+if ($opts['force-on'] && $opts['force-off']) {
+    fwrite(STDERR, "Opzioni in conflitto: --force-on e --force-off.\n");
+    exit(EXIT_USAGE);
+}
+
+// ---------------------------------------------------------------------------
+// Caricamento e validazione configurazione
+// ---------------------------------------------------------------------------
+$configPath = $opts['config'];
+
+if (!is_file($configPath)) {
+    fwrite(STDERR, "Config non trovata: {$configPath}\n");
+    exit(2);
+}
+
+// Controllo permessi: il file con le credenziali NON deve essere
+// leggibile/scrivibile da altri utenti (richiediamo 600 o piu restrittivo).
+$perms = fileperms($configPath) & 0o777;
+if (($perms & 0o077) !== 0) {
+    fwrite(STDERR, sprintf(
+        "ATTENZIONE: permessi insicuri su %s (%04o). Esegui: chmod 600 %s\n",
+        $configPath, $perms, $configPath
+    ));
+    exit(2);
+}
+
+$config = require $configPath;
+
+$required = ['api_token', 'zone_id'];
+foreach ($required as $key) {
+    if (empty($config[$key])) {
+        fwrite(STDERR, "Config incompleta: manca '{$key}'\n");
+        exit(2);
+    }
+}
+
+// Valori di default
+$config += [
+    // Modalita di trigger:
+    //   'load'     -> basata sul load average del server
+    //   'requests' -> basata sulle richieste/sec verso la zona (GraphQL)
+    //   'both'     -> attiva se UNA delle due soglie viene superata
+    'trigger_mode'        => 'load',
+
+    // Numero di core: se null, viene rilevato automaticamente.
+    'cpu_cores'        => null,
+    // Soglia di attivazione UAM, espressa come load-per-core (1-min).
+    'threshold_on'     => 1.50,
+    // Soglia di rientro: load-per-core sotto cui si torna al livello normale.
+    'threshold_off'    => 0.70,
+
+    // --- Parametri modalita 'requests' ------------------------------------
+    // Soglia di attivazione: richieste/sec verso la zona.
+    'req_threshold_on'    => 50.0,
+    // Soglia di rientro: richieste/sec sotto cui si torna al normale.
+    'req_threshold_off'   => 20.0,
+    // Finestra (in minuti) su cui mediare le richieste/sec.
+    // I dati di httpRequests1mGroups hanno ~1-2 min di ritardo.
+    'req_window_minutes'  => 5,
+    // Livello "normale" a cui tornare quando il carico scende.
+    'normal_level'     => 'medium', // off|essentially_off|low|medium|high
+    // Quale load average usare: 0=1min, 1=5min, 2=15min
+    'load_index'       => 0,
+    // Tempo minimo (secondi) di permanenza in UAM prima di poter rientrare,
+    // per evitare flapping.
+    'min_uam_seconds'  => 600,
+    // File di stato (deve essere scrivibile dall'utente cron).
+    // In hosting condiviso lo teniamo accanto allo script, nella home.
+    'state_file'       => __DIR__ . '/vigilant-state.json',
+    // File di log (opzionale). Se null, logga su stdout.
+    'log_file'         => null,
+    // Timeout chiamate HTTP.
+    'http_timeout'     => 15,
+];
+
+// ---------------------------------------------------------------------------
+// Logging
+// ---------------------------------------------------------------------------
+function logmsg(array $config, string $level, string $msg): void
+{
+    $line = sprintf('[%s] %-5s %s', date('Y-m-d H:i:s'), $level, $msg);
+    if (!empty($config['log_file'])) {
+        @file_put_contents($config['log_file'], $line . "\n", FILE_APPEND | LOCK_EX);
+    } else {
+        $stream = $level === 'ERROR' ? STDERR : STDOUT;
+        fwrite($stream, $line . "\n");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rilevamento numero di core
+// ---------------------------------------------------------------------------
+function detectCores(): int
+{
+    // In hosting condiviso shell_exec/exec sono quasi sempre disabilitati:
+    // ci affidiamo solo alla lettura di /proc, che non richiede comandi
+    // esterni. Se anche /proc e' fuori da open_basedir, si usa 1 (e va
+    // comunque impostato 'cpu_cores' manualmente nella config).
+    if (@is_readable('/proc/cpuinfo')) {
+        $content = @file_get_contents('/proc/cpuinfo');
+        if ($content !== false) {
+            $n = preg_match_all('/^processor\s*:/m', $content);
+            if ($n > 0) {
+                return $n;
+            }
+        }
+    }
+    return 1;
+}
+
+// ---------------------------------------------------------------------------
+// Lettura load average
+// ---------------------------------------------------------------------------
+function getLoadAverages(): array
+{
+    // Preferisci /proc/loadavg: in hosting condiviso sys_getloadavg() a volte
+    // e' nella disable_functions, mentre /proc/loadavg resta leggibile.
+    if (@is_readable('/proc/loadavg')) {
+        $raw = @file_get_contents('/proc/loadavg');
+        if ($raw !== false) {
+            $parts = preg_split('/\s+/', trim($raw));
+            if (count($parts) >= 3) {
+                return [(float)$parts[0], (float)$parts[1], (float)$parts[2]];
+            }
+        }
+    }
+    if (function_exists('sys_getloadavg')) {
+        $la = @sys_getloadavg();
+        if (is_array($la) && count($la) === 3) {
+            return $la;
+        }
+    }
+    fwrite(STDERR,
+        "Impossibile leggere il load average: sia /proc/loadavg sia " .
+        "sys_getloadavg() non sono accessibili in questo hosting.\n");
+    exit(2);
+}
+
+// ---------------------------------------------------------------------------
+// Stato persistente (per anti-flapping)
+// ---------------------------------------------------------------------------
+function loadState(array $config): array
+{
+    if (is_file($config['state_file'])) {
+        $data = json_decode((string)file_get_contents($config['state_file']), true);
+        if (is_array($data)) {
+            return $data;
+        }
+    }
+    return ['uam_active' => false, 'changed_at' => 0];
+}
+
+function saveState(array $config, array $state): void
+{
+    @file_put_contents(
+        $config['state_file'],
+        json_encode($state, JSON_PRETTY_PRINT),
+        LOCK_EX
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Cloudflare API
+// ---------------------------------------------------------------------------
+function cfRequestCurl(array $config, string $url, string $method, array $headers, ?string $payload): array
+{
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_CUSTOMREQUEST  => $method,
+        CURLOPT_HTTPHEADER     => $headers,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT        => $config['http_timeout'],
+        CURLOPT_CONNECTTIMEOUT => 10,
+    ]);
+    if ($payload !== null) {
+        curl_setopt($ch, CURLOPT_POSTFIELDS, $payload);
+    }
+    $raw  = curl_exec($ch);
+    $err  = curl_error($ch);
+    $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+
+    return [$raw === false ? null : $raw, $code, $err];
+}
+
+function cfRequestStream(array $config, string $url, string $method, array $headers, ?string $payload): array
+{
+    $ctx = stream_context_create(['http' => [
+        'method'        => $method,
+        'header'        => implode("\r\n", $headers),
+        'content'       => $payload ?? '',
+        'timeout'       => $config['http_timeout'],
+        'ignore_errors' => true, // cosi leggiamo il body anche su HTTP 4xx/5xx
+    ]]);
+
+    $raw  = @file_get_contents($url, false, $ctx);
+    $code = 0;
+    if (isset($http_response_header[0]) &&
+        preg_match('#\s(\d{3})\s#', $http_response_header[0], $m)) {
+        $code = (int)$m[1];
+    }
+    $err = $raw === false ? 'richiesta HTTP via stream fallita' : '';
+
+    return [$raw === false ? null : $raw, $code, $err];
+}
+
+function cfRequest(array $config, string $method, string $path, ?array $body = null): array
+{
+    $url     = 'https://api.cloudflare.com/client/v4' . $path;
+    $payload = $body !== null ? json_encode($body) : null;
+    $headers = [
+        'Authorization: Bearer ' . $config['api_token'],
+        'Content-Type: application/json',
+    ];
+
+    // cURL e' la via preferita; in molti hosting condivisi pero' e'
+    // disabilitato, quindi prevediamo il fallback su stream HTTP.
+    if (function_exists('curl_init')) {
+        [$raw, $code, $err] = cfRequestCurl($config, $url, $method, $headers, $payload);
+    } elseif (ini_get('allow_url_fopen')) {
+        [$raw, $code, $err] = cfRequestStream($config, $url, $method, $headers, $payload);
+    } else {
+        throw new RuntimeException(
+            'Ne cURL ne allow_url_fopen sono disponibili: impossibile ' .
+            'contattare le API Cloudflare in questo hosting.'
+        );
+    }
+
+    if ($raw === false || $raw === null) {
+        throw new RuntimeException("Errore di rete: {$err}");
+    }
+
+    $data = json_decode($raw, true);
+    if (!is_array($data)) {
+        throw new RuntimeException("Risposta Cloudflare non valida (HTTP {$code}): {$raw}");
+    }
+
+    // L'endpoint GraphQL (/graphql) NON usa l'envelope {success,...} delle API
+    // REST: restituisce {data,errors}. Validiamo qui solo le risposte REST;
+    // gli errori GraphQL vengono gestiti dal chiamante.
+    if ($path === '/graphql') {
+        if ($code >= 400) {
+            throw new RuntimeException("GraphQL HTTP {$code}: {$raw}");
+        }
+        return $data;
+    }
+
+    if (empty($data['success'])) {
+        $msg = isset($data['errors'])
+            ? json_encode($data['errors'])
+            : 'errore sconosciuto';
+        throw new RuntimeException("API Cloudflare fallita (HTTP {$code}): {$msg}");
+    }
+
+    return $data;
+}
+
+function getSecurityLevel(array $config): string
+{
+    $resp = cfRequest(
+        $config,
+        'GET',
+        "/zones/{$config['zone_id']}/settings/security_level"
+    );
+    return (string)($resp['result']['value'] ?? 'unknown');
+}
+
+function setSecurityLevel(array $config, string $level): void
+{
+    cfRequest(
+        $config,
+        'PATCH',
+        "/zones/{$config['zone_id']}/settings/security_level",
+        ['value' => $level]
+    );
+}
+
+/**
+ * Interroga la GraphQL Analytics API per le richieste totali verso la zona
+ * nell'ultima finestra di N minuti e restituisce la media richieste/sec.
+ *
+ * Richiede che l'API Token abbia anche il permesso:
+ *   Zone > Analytics > Read   (Account Analytics non basta).
+ */
+function getRequestsPerSecond(array $config): float
+{
+    $minutes = max(1, (int)$config['req_window_minutes']);
+
+    // I dati di httpRequests1mGroups hanno un piccolo ritardo: chiudiamo la
+    // finestra a "ora - 1 minuto" per evitare l'ultimo minuto incompleto.
+    $end   = new DateTimeImmutable('-1 minute', new DateTimeZone('UTC'));
+    $start = $end->sub(new DateInterval("PT{$minutes}M"));
+    $fmt   = 'Y-m-d\TH:i:s\Z';
+
+    $query = <<<'GQL'
+    query ($zoneTag: String!, $start: Time!, $end: Time!) {
+      viewer {
+        zones(filter: { zoneTag: $zoneTag }) {
+          httpRequests1mGroups(
+            limit: 1000
+            filter: { datetime_geq: $start, datetime_lt: $end }
+          ) {
+            sum { requests }
+          }
+        }
+      }
+    }
+    GQL;
+
+    $resp = cfRequest($config, 'POST', '/graphql', [
+        'query'     => $query,
+        'variables' => [
+            'zoneTag' => $config['zone_id'],
+            'start'   => $start->format($fmt),
+            'end'     => $end->format($fmt),
+        ],
+    ]);
+
+    // La GraphQL API puo restituire success=true con errori applicativi.
+    if (!empty($resp['errors'])) {
+        throw new RuntimeException(
+            'GraphQL Analytics ha restituito errori: ' . json_encode($resp['errors'])
+        );
+    }
+
+    $groups = $resp['data']['viewer']['zones'][0]['httpRequests1mGroups'] ?? [];
+    $total  = 0;
+    foreach ($groups as $g) {
+        $total += (int)($g['sum']['requests'] ?? 0);
+    }
+
+    return $total / ($minutes * 60);
+}
+
+// ---------------------------------------------------------------------------
+// MAIN
+// ---------------------------------------------------------------------------
+try {
+    // --status
+    if ($opts['status']) {
+        $level = getSecurityLevel($config);
+        $cores = max(1, (int)($config['cpu_cores'] ?? detectCores()));
+        $la    = getLoadAverages();
+        printf(
+            "Trigger mode              : %s\n" .
+            "Security level Cloudflare : %s\n" .
+            "Load average (1/5/15)     : %.2f / %.2f / %.2f\n" .
+            "Core rilevati             : %d\n" .
+            "Load per core (1-min)     : %.2f  (on>=%.2f / off<=%.2f)\n",
+            $config['trigger_mode'], $level, $la[0], $la[1], $la[2], $cores,
+            $la[0] / $cores, $config['threshold_on'], $config['threshold_off']
+        );
+        if ($config['trigger_mode'] === 'requests' || $config['trigger_mode'] === 'both') {
+            $rps = getRequestsPerSecond($config);
+            printf(
+                "Richieste/sec (%d min)     : %.1f  (on>=%.1f / off<=%.1f)\n",
+                $config['req_window_minutes'], $rps,
+                $config['req_threshold_on'], $config['req_threshold_off']
+            );
+        }
+        exit(0);
+    }
+
+    // --force-off
+    if ($opts['force-off']) {
+        setSecurityLevel($config, $config['normal_level']);
+        saveState($config, ['uam_active' => false, 'changed_at' => time()]);
+        logmsg($config, 'INFO', "Forzato livello normale: {$config['normal_level']}");
+        exit(0);
+    }
+
+    // --force-on
+    if ($opts['force-on']) {
+        setSecurityLevel($config, 'under_attack');
+        saveState($config, ['uam_active' => true, 'changed_at' => time()]);
+        logmsg($config, 'INFO', 'Forzata modalita Under Attack.');
+        exit(0);
+    }
+
+    // Ciclo automatico
+    $mode = $config['trigger_mode'];
+    if (!in_array($mode, ['load', 'requests', 'both'], true)) {
+        throw new RuntimeException("trigger_mode non valido: '{$mode}'");
+    }
+
+    // Raccogliamo una o piu metriche. Ognuna porta: valore corrente, soglia di
+    // attivazione, soglia di rientro e una descrizione per il log.
+    $metrics = [];
+
+    if ($mode === 'load' || $mode === 'both') {
+        $cores       = max(1, (int)($config['cpu_cores'] ?? detectCores()));
+        $la          = getLoadAverages();
+        $loadPerCore = $la[$config['load_index']] / $cores;
+        $metrics[]   = [
+            'name'   => 'load/core',
+            'value'  => $loadPerCore,
+            'on'     => (float)$config['threshold_on'],
+            'off'    => (float)$config['threshold_off'],
+            'format' => '%.2f',
+        ];
+    }
+
+    if ($mode === 'requests' || $mode === 'both') {
+        $rps       = getRequestsPerSecond($config);
+        $metrics[] = [
+            'name'   => 'req/s',
+            'value'  => $rps,
+            'on'     => (float)$config['req_threshold_on'],
+            'off'    => (float)$config['req_threshold_off'],
+            'format' => '%.1f',
+        ];
+    }
+
+    // Condizioni aggregate:
+    //  - ATTIVA se ALMENO UNA metrica supera la propria soglia 'on'.
+    //  - RIENTRA solo se TUTTE le metriche sono sotto la propria soglia 'off'.
+    $anyOver  = false;
+    $allUnder = true;
+    $desc     = [];
+    foreach ($metrics as $m) {
+        if ($m['value'] >= $m['on']) {
+            $anyOver = true;
+        }
+        if ($m['value'] > $m['off']) {
+            $allUnder = false;
+        }
+        $desc[] = sprintf(
+            "%s {$m['format']} (on>={$m['format']}, off<={$m['format']})",
+            $m['name'], $m['value'], $m['on'], $m['off']
+        );
+    }
+    $descStr = implode(', ', $desc);
+
+    $state     = loadState($config);
+    $uamActive = (bool)($state['uam_active'] ?? false);
+    $changedAt = (int)($state['changed_at'] ?? 0);
+    $now       = time();
+
+    if (!$uamActive && $anyOver) {
+        // Soglia superata -> attiva UAM
+        setSecurityLevel($config, 'under_attack');
+        saveState($config, ['uam_active' => true, 'changed_at' => $now]);
+        logmsg($config, 'WARN', "Soglia superata [{$descStr}]: ATTIVATA Under Attack.");
+    } elseif ($uamActive && $allUnder) {
+        // Carico/traffico rientrato -> verifica anti-flapping prima di disattivare
+        $elapsed = $now - $changedAt;
+        if ($elapsed >= $config['min_uam_seconds']) {
+            setSecurityLevel($config, $config['normal_level']);
+            saveState($config, ['uam_active' => false, 'changed_at' => $now]);
+            logmsg($config, 'INFO',
+                "Rientrato [{$descStr}]: ripristinato livello {$config['normal_level']}.");
+        } else {
+            logmsg($config, 'INFO', sprintf(
+                'Rientrato ma UAM attivo da soli %ds (< %ds): attendo. [%s]',
+                $elapsed, $config['min_uam_seconds'], $descStr
+            ));
+        }
+    } else {
+        logmsg($config, 'INFO',
+            sprintf('Nessuna azione (UAM=%s) [%s].', $uamActive ? 'on' : 'off', $descStr));
+    }
+
+    exit(0);
+
+} catch (Throwable $e) {
+    logmsg($config ?? ['log_file' => null], 'ERROR', $e->getMessage());
+    exit(1);
+}
