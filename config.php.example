@@ -1,88 +1,63 @@
 <?php
 /**
- * config.php  --  credenziali e parametri per vigilant
+ * config.php — credentials and settings for vigilant
  *
- * IMPORTANTISSIMO PER LA SICUREZZA:
- *   - Copia questo file in config.php
- *   - Imposta i permessi a 600 (solo il proprietario puo leggere/scrivere):
- *         chmod 600 config.php
- *   - Assicurati che il proprietario sia l'utente che esegue il cron:
- *         chown utente-cron config.php
- *   - NON inserire questo file in un repository pubblico (.gitignore).
+ * SECURITY:
+ *   - Copy this file to config.php
+ *   - Restrict it:  chmod 600 config.php
+ *   - Owner must be the cron user:  chown cron-user config.php
+ *   - Never commit config.php (it is in .gitignore)
  *
- * Le credenziali NON vengono passate come argomenti da riga di comando
- * proprio perche sarebbero visibili ad altri utenti tramite `ps aux` o
- * /proc. Restano confinate in questo file protetto.
+ * Credentials are kept here, never passed as CLI arguments (those are visible
+ * to other users via `ps aux` / /proc).
  */
 
 return [
-    // --- Credenziali Cloudflare -------------------------------------------
-    // Crea un API Token SCOPED (NON la Global API Key) da:
-    //   Cloudflare Dashboard > My Profile > API Tokens > Create Token
-    // Permessi minimi necessari (limitati alla zona specifica):
-    //   Zone > Zone Settings > Edit   (leggere/scrivere security_level)
-    //   Zone > Analytics    > Read    (SOLO se usi trigger_mode 'requests'/'both')
-    'api_token' => 'INSERISCI_QUI_IL_TUO_API_TOKEN',
+    // --- Cloudflare credentials -------------------------------------------
+    // Create a SCOPED API Token (not the Global API Key):
+    //   Dashboard > My Profile > API Tokens > Create Token
+    // Minimum permissions (scoped to the single zone):
+    //   Zone > Zone Settings > Edit   (read/write security_level)
+    //   Zone > Analytics     > Read   (only for trigger_mode 'requests'/'both')
+    'api_token' => 'YOUR_API_TOKEN_HERE',
 
-    // Zone ID del dominio (Dashboard > Overview > API > Zone ID).
-    'zone_id'   => 'INSERISCI_QUI_LO_ZONE_ID',
+    // Zone ID (Dashboard > your domain > Overview).
+    'zone_id'   => 'YOUR_ZONE_ID_HERE',
 
-    // --- Modalita di trigger ----------------------------------------------
-    //   'load'     -> usa il load average del server.
-    //                 ATTENZIONE: in hosting condiviso e' il carico dell'INTERA
-    //                 macchina (tutti gli utenti), non solo del tuo sito.
-    //   'requests' -> usa le richieste/sec verso la TUA zona (GraphQL Analytics).
-    //                 Piu' adatto allo scenario shared hosting / anti-DDoS.
-    //   'both'     -> attiva se almeno una delle due soglie viene superata;
-    //                 rientra solo quando ENTRAMBE sono sotto la soglia 'off'.
+    // --- Trigger mode -----------------------------------------------------
+    //   'load'     -> server load average.
+    //                 NOTE: on shared hosting this is the WHOLE machine's load
+    //                 (all tenants), not just your site.
+    //   'requests' -> requests/sec to YOUR zone (GraphQL Analytics).
+    //                 Better suited to shared hosting / anti-DDoS.
+    //   'both'     -> ON if either threshold is exceeded; stands down only
+    //                 when BOTH are back under their 'off' threshold.
     'trigger_mode'    => 'requests',
 
-    // --- Parametri modalita 'load' ----------------------------------------
-    // Numero di core CPU. null = rilevamento automatico.
-    'cpu_cores'       => null,
+    // --- 'load' mode ------------------------------------------------------
+    'cpu_cores'       => null,   // null = auto-detect
+    'load_index'      => 0,      // 0=1min, 1=5min, 2=15min
+    'threshold_on'    => 1.50,   // load-per-core to switch UAM on
+    'threshold_off'   => 0.70,   // load-per-core to switch UAM off (keep < on)
 
-    // Quale load average usare: 0 = 1min, 1 = 5min, 2 = 15min.
-    'load_index'      => 0,
+    // --- 'requests' mode --------------------------------------------------
+    // Tip: set 'on' to ~3-5x your usual peak so legit spikes don't trip it.
+    'req_threshold_on'  => 50.0, // requests/sec to switch UAM on
+    'req_threshold_off' => 20.0, // requests/sec to switch UAM off (keep < on)
+    'req_window_minutes' => 5,   // averaging window
 
-    // Soglia di ATTIVAZIONE: load-average-per-core oltre cui si attiva UAM.
-    // Es. 1.50 = il sistema e' al 150% della capacita nominale.
-    'threshold_on'    => 1.50,
-
-    // Soglia di RIENTRO: load-average-per-core sotto cui si torna al normale.
-    // Tienila piu' bassa di threshold_on per creare isteresi (anti-flapping).
-    'threshold_off'   => 0.70,
-
-    // --- Parametri modalita 'requests' ------------------------------------
-    // Soglia di ATTIVAZIONE: richieste/sec verso la zona oltre cui si attiva UAM.
-    // Taratura: guarda il traffico normale di picco del tuo sito e mettila
-    // sensibilmente piu' alta (es. 3-5x il picco abituale).
-    'req_threshold_on'  => 50.0,
-
-    // Soglia di RIENTRO: richieste/sec sotto cui si torna al normale.
-    'req_threshold_off' => 20.0,
-
-    // Finestra (minuti) su cui mediare le richieste/sec. 5 e' un buon valore:
-    // i dati GraphQL hanno ~1-2 min di ritardo e una finestra breve e' rumorosa.
-    'req_window_minutes' => 5,
-
-    // Livello a cui tornare quando il carico rientra:
-    //   off | essentially_off | low | medium | high
+    // --- Common -----------------------------------------------------------
+    // Level to restore: off|essentially_off|low|medium|high
     'normal_level'    => 'medium',
 
-    // Permanenza minima in UAM (secondi) prima di poter rientrare.
+    // Minimum time (seconds) UAM stays on before it may stand down.
     'min_uam_seconds' => 600,
 
-    // --- File di servizio --------------------------------------------------
-    // ATTENZIONE hosting condiviso: usa SEMPRE percorsi dentro la tua home
-    // (es. /home/TUOUTENTE/vigilant/...). Cartelle come /var/lib o /var/log
-    // non sono scrivibili e spesso sono fuori da open_basedir.
-    //
-    // File di stato per l'anti-flapping (deve essere scrivibile dal cron).
+    // Service files. On shared hosting keep them inside your home directory
+    // (/var/lib, /var/log are not writable and often outside open_basedir).
     'state_file'      => __DIR__ . '/vigilant-state.json',
+    'log_file'        => __DIR__ . '/vigilant.log', // null = stdout/stderr
 
-    // File di log. null = scrive su stdout/stderr (utile per MAILTO del cron).
-    'log_file'        => __DIR__ . '/vigilant.log',
-
-    // Timeout HTTP verso le API Cloudflare (secondi).
+    // HTTP timeout (seconds).
     'http_timeout'    => 15,
 ];
